@@ -1,13 +1,5 @@
 /*
  * File: assignment1.cpp
- *
- * Framework to implement Task 1 of the Multi-Core Processor Systems lab
- * session. This uses the framework library to interface with tracefiles which
- * will drive the read/write requests
- *
- * Author(s): Michiel W. van Tol, Mike Lankamp, Jony Zhang,
- *            Konstantinos Bousias, Simon Polstra
- *
  */
 
 #include <iostream>
@@ -21,17 +13,17 @@ using namespace std;
 using namespace sc_core; // This pollutes namespace, better: only import what you need.
 
 struct CacheLine {
-    uint64_t tag;
-    double lu_time;
+    uint64_t tag; // Stores the block adress
+    double lu_time; // least recently used time for cache eviction 
     bool valid;
     bool dirty; 
 };
 
-static const size_t CACHE_SIZE = 32000; // Byte 
-static const size_t SET_ASSOC = 8;
-static const size_t LINE_SIZE = 32; // Byte 
+static const size_t CACHE_SIZE = 8; // Byte 
+static const size_t SET_ASSOC = 4;
+static const size_t LINE_SIZE = 1; // Byte 
 static const size_t N_SETS = (CACHE_SIZE / LINE_SIZE) / SET_ASSOC; 
-static const bool VERBOSE = false;
+static const bool VERBOSE = true; // Toggle logging  
 
 SC_MODULE(Cache) {
     public:
@@ -39,21 +31,21 @@ SC_MODULE(Cache) {
 
     enum RetCode { RET_READ_DONE, RET_WRITE_DONE };
 
-    enum RetStatusCode { RET_CACHE_MISS, RET_CACHE_HIT };
+    enum RetStatusCode { RET_CACHE_MISS, RET_CACHE_HIT }; // Status code to signify to the cpu if the read/write cause a hit/miss 
 
     sc_in<bool> Port_CLK;
     sc_in<Function> Port_Func;
     sc_in<uint64_t> Port_Addr;
     sc_out<RetCode> Port_Done;
     sc_inout_rv<64> Port_Data;
-    sc_out<RetStatusCode> Port_Status;
+    sc_out<RetStatusCode> Port_Status; // Wire for the hit/miss status code 
 
     SC_CTOR(Cache) {
         SC_THREAD(execute);
         sensitive << Port_CLK.pos();
         dont_initialize();
 
-        line_table = (CacheLine **)malloc(sizeof(CacheLine *) * N_SETS);
+        line_table = (CacheLine **)malloc(sizeof(CacheLine *) * N_SETS); // Initialite the cache line 
         for (size_t i = 0; i < N_SETS; i++) {
             line_table[i] = (CacheLine *)malloc(sizeof(CacheLine) * SET_ASSOC);
 
@@ -70,26 +62,36 @@ SC_MODULE(Cache) {
         VERBOSE && cout << "-------------------------------" << endl;
     } 
 
-    private:
-    CacheLine **line_table;
+    void dump() {
+        for (size_t i = 0; i < N_SETS; i++) {
+            cout << "Cache set: " << i << endl;    
+            for(size_t j = 0; j < SET_ASSOC; j++) {
+                cout << "   Cache Line: " << j << " {tag=" << line_table[i][j].tag << ", lu_time=" << line_table[i][j].lu_time << ", valid=" << line_table[i][j].valid << ", dirty=" << line_table[i][j].dirty << "}" << endl;    
+            }
+        }
+    }
 
+    private:
+    CacheLine **line_table; // Array of Sets with size SET_ASSOC (e.g. 8 for an 8-way set-associative cache)
+
+    // Returns the index in a cache set into which a new address should be inserted to and informs the cpu about a hit/miss
     uint64_t probe_cache(CacheLine *c_set, uint64_t block_addr) {
         double min_lu_time = UINT64_MAX;
         double min_lu_index = 0;
         int i = 0;
 
         while (i < SET_ASSOC) {
-            if(!c_set[i].valid) { // Empty cache line 
+            if(!c_set[i].valid) { // Find an empty cache line for insertion
                min_lu_index = i;
                min_lu_time = 0;
             }
-            else if(c_set[i].tag == block_addr) { // Cache hit 
+            else if(c_set[i].tag == block_addr) { // If a cache hit is found return immidiately  
                 VERBOSE && cout << sc_time_stamp() << ": Cache hit" << endl;
                 Port_Status.write(RET_CACHE_HIT);
                 return i;
             }
 
-            else if (c_set[i].lu_time < min_lu_time) { // Find index to evict least recently used 
+            else if (c_set[i].lu_time < min_lu_time) { // Find a cache line to evict for insertion
                 min_lu_index = i;
                 min_lu_time = c_set[i].lu_time;
             }
@@ -103,12 +105,14 @@ SC_MODULE(Cache) {
         return min_lu_index;
     }
 
+    // Refreshes the last recently used time
     void refresh_lu_time(CacheLine *c_set, uint64_t block_addr, uint64_t index) {
         c_set[index].lu_time = sc_time_stamp().to_double(); // Refresh last used time
         VERBOSE && cout << sc_time_stamp() << ": Cache refreshes last used time of " << block_addr << " to " << sc_time_stamp() << endl;
     }
 
 
+    // Inserts a CacheLine into a set and evicts a coliding cache line if necessary
     void allocate(CacheLine *c_set, uint64_t block_addr, uint64_t index, bool is_write) {
         if(c_set[index].tag != block_addr && c_set[index].valid) { // evict element
             VERBOSE && cout << sc_time_stamp() << ": Cache evicts " << c_set[index].tag << endl;
@@ -136,7 +140,7 @@ SC_MODULE(Cache) {
         if (c_set[index].tag == block_addr && c_set[index].valid) { // Cache hit 
             refresh_lu_time(c_set, block_addr, index);
             wait(1);
-        } else {
+        } else { // Load block_addr from main memory and evict if necessary 
             allocate(c_set, block_addr, index, false);
         }
     }
@@ -155,7 +159,8 @@ SC_MODULE(Cache) {
             size_t set_index = block_addr % N_SETS;
             CacheLine *c_set = line_table[set_index];
 
-            uint64_t index = probe_cache(c_set, block_addr);
+            // Find the index in the c_set at which cache line should be manipulated (in case of a hit) / inserted (in case of a miss)
+            uint64_t index = probe_cache(c_set, block_addr); 
             if (f == FUNC_WRITE) {
                 data = Port_Data.read().to_uint64();
                 write_cache(c_set, block_addr, index);
@@ -321,7 +326,7 @@ int sc_main(int argc, char *argv[]) {
 
         // Print statistics after simulation finished
         stats_print();
-        // cache.dump(); // Uncomment to dump cacheory to stdout.
+        //cache.dump(); // Uncomment to dump cacheory to stdout.
       
     }
     catch (exception &e) {

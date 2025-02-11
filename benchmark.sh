@@ -26,7 +26,7 @@ for file_path in "${TRACEFILES[@]}"; do
   file_name=$(basename "$file_path" .trf)
 
   # Execute the command and capture its output
-  output=$(./assignment_1.bin "$file_path")
+  output=$(./memory.bin "$file_path")
 
   # Check if the command produced valid output
   if [[ -z "$output" ]]; then
