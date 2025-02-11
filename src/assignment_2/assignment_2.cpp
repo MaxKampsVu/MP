@@ -24,14 +24,13 @@ struct CacheLine {
     uint64_t tag;
     double lu_time;
     bool valid;
-    bool dirty; 
 };
 
 static const size_t CACHE_SIZE = 32000; // Byte 
 static const size_t SET_ASSOC = 8;
 static const size_t LINE_SIZE = 32; // Byte 
 static const size_t N_SETS = (CACHE_SIZE / LINE_SIZE) / SET_ASSOC; 
-static const bool VERBOSE = false;
+
 
 SC_MODULE(Cache) {
     public:
@@ -58,22 +57,22 @@ SC_MODULE(Cache) {
             line_table[i] = (CacheLine *)malloc(sizeof(CacheLine) * SET_ASSOC);
 
             for(size_t j = 0; j < SET_ASSOC; j++) {
-                line_table[i][j] = (CacheLine) {.tag = 0, .lu_time = 0.0, .valid = false, .dirty = false};
+                line_table[i][j] = (CacheLine) {.tag = 0, .lu_time = 0.0, .valid = false};
             }
         }
 
-        VERBOSE && cout << "---------- Cache Specs --------" << endl;
-        VERBOSE && cout << "Cache size: " << CACHE_SIZE << " B" << endl;
-        VERBOSE && cout << "Line size: " << LINE_SIZE << " B" << endl;
-        VERBOSE && cout << "Set associativity: " << SET_ASSOC << endl;
-        VERBOSE && cout << "Number of Sets: " << N_SETS << endl;
-        VERBOSE && cout << "-------------------------------" << endl;
+        cout << "---------- Cache Specs --------" << endl;
+        cout << "Cache size: " << CACHE_SIZE << " B" << endl;
+        cout << "Line size: " << LINE_SIZE << " B" << endl;
+        cout << "Set associativity: " << SET_ASSOC << endl;
+        cout << "Number of Sets: " << N_SETS << endl;
+        cout << "-------------------------------" << endl;
     } 
 
     private:
     CacheLine **line_table;
 
-    uint64_t probe_cache(CacheLine *c_set, uint64_t block_addr) {
+    uint64_t probe_cache(CacheLine *c_set, uint64_t addr) {
         double min_lu_time = UINT64_MAX;
         double min_lu_index = 0;
         int i = 0;
@@ -82,14 +81,17 @@ SC_MODULE(Cache) {
             if(!c_set[i].valid) { // Empty cache line 
                min_lu_index = i;
                min_lu_time = 0;
+               break;
             }
-            else if(c_set[i].tag == block_addr) { // Cache hit 
-                VERBOSE && cout << sc_time_stamp() << ": Cache hit" << endl;
+
+            if(c_set[i].tag == addr) { // Cache hit 
+                wait(1);
+                cout << sc_time_stamp() << ": Write Cache hit" << endl;
                 Port_Status.write(RET_CACHE_HIT);
                 return i;
             }
 
-            else if (c_set[i].lu_time < min_lu_time) { // Find index to evict least recently used 
+            if (c_set[i].lu_time < min_lu_time) { // Evict least recently used 
                 min_lu_index = i;
                 min_lu_time = c_set[i].lu_time;
             }
@@ -98,47 +100,43 @@ SC_MODULE(Cache) {
         }
 
         // Cache miss 
-        VERBOSE && cout << sc_time_stamp() << ": Cache miss, fetching from main" << endl;
+        cout << sc_time_stamp() << ": Write Cache miss, fetching from main" << endl;
+        wait(100); // TODO: Ask if this takes a 100 cycles in the case that we write back an element and the case that we write in an empty cache cell 
         Port_Status.write(RET_CACHE_MISS);
         return min_lu_index;
     }
 
-    void refresh_lu_time(CacheLine *c_set, uint64_t block_addr, uint64_t index) {
-        c_set[index].lu_time = sc_time_stamp().to_double(); // Refresh last used time
-        VERBOSE && cout << sc_time_stamp() << ": Cache refreshes last used time of " << block_addr << " to " << sc_time_stamp() << endl;
+    void write_cache(CacheLine *c_set, uint64_t addr, uint64_t index) {
+        if (c_set[index].valid) {
+            cout << sc_time_stamp() << ": Cache evicts " << c_set[index].tag << endl;
+        }
+    
+       c_set[index] = (CacheLine) {.tag = addr, .lu_time = sc_time_stamp().to_double(), .valid = true};
     }
 
+    void read_cache(CacheLine *c_set, uint64_t addr) {
+        int i = 0;
 
-    void allocate(CacheLine *c_set, uint64_t block_addr, uint64_t index, bool is_write) {
-        if(c_set[index].tag != block_addr && c_set[index].valid) { // evict element
-            VERBOSE && cout << sc_time_stamp() << ": Cache evicts " << c_set[index].tag << endl;
-            if(c_set[index].dirty) { // writeback if dirty
-                wait(100); 
-                VERBOSE && cout << sc_time_stamp() << ": Cache write back dirty block_addr " << c_set[index].tag << " to main" << endl;
-            } 
+        while (i < SET_ASSOC) {
+            if(c_set[i].tag == addr && c_set[i].valid) { // Cache hit 
+                c_set[i].lu_time = sc_time_stamp().to_double(); // Refresh last used time
+                wait(1);
+                cout << sc_time_stamp() << ": Read Cache hit" << endl;
+                cout << sc_time_stamp() << ": Cache refreshes last used time of " << addr << " to " << sc_time_stamp() << endl;
+                Port_Status.write(RET_CACHE_HIT);
+                return;
+            }
+
+            i++;
         }
-        wait(100); 
-        c_set[index] = (CacheLine) {.tag = block_addr, .lu_time = sc_time_stamp().to_double(), .valid = true, .dirty = is_write};
-        VERBOSE && cout << sc_time_stamp() << ": Cache writes " << c_set[index].tag << endl;
+
+        cout << sc_time_stamp() << ": Read Cache miss, fetching from main" << endl;
+        wait(100); // Cache miss 
+        Port_Status.write(RET_CACHE_MISS);
     }
 
-    void write_cache(CacheLine *c_set, uint64_t block_addr, uint64_t index) {
-        if (c_set[index].tag == block_addr && c_set[index].valid) { // Cache hit 
-            refresh_lu_time(c_set, block_addr, index);
-            c_set[index].dirty = true;
-            wait(1);
-        } else { // Load block_addr from main memory and evict if necessary 
-            allocate(c_set, block_addr, index, true);
-        }
-    }
+    void write_memory() {
 
-    void read_cache(CacheLine *c_set, uint64_t block_addr, uint64_t index) {
-        if (c_set[index].tag == block_addr && c_set[index].valid) { // Cache hit 
-            refresh_lu_time(c_set, block_addr, index);
-            wait(1);
-        } else {
-            allocate(c_set, block_addr, index, false);
-        }
     }
 
     void execute() {
@@ -148,19 +146,21 @@ SC_MODULE(Cache) {
             // Receive function from CPU
             Function f = Port_Func.read();
             uint64_t addr = Port_Addr.read();
-            uint64_t block_addr = addr / LINE_SIZE;
             uint64_t data = 0;
 
-            // Determine cache set for block_addr
-            size_t set_index = block_addr % N_SETS;
+            // Determine cache set for addr
+            size_t set_index = addr % N_SETS;
             CacheLine *c_set = line_table[set_index];
 
-            uint64_t index = probe_cache(c_set, block_addr);
             if (f == FUNC_WRITE) {
+                cout << sc_time_stamp() << ": Cache receives " << addr << " write" << endl;
                 data = Port_Data.read().to_uint64();
-                write_cache(c_set, block_addr, index);
+                uint64_t index = probe_cache(c_set, addr);
+                write_cache(c_set, addr, index);
+                cout << sc_time_stamp() << ": Cache writes " << addr << " to set " << set_index << " in cache line " << index << endl;
             } else {
-                read_cache(c_set, block_addr, index);
+                cout << sc_time_stamp() << ": Cache receives " << addr << " read" << endl;
+                read_cache(c_set, addr);
             }
 
             if (f == FUNC_READ) {
@@ -174,8 +174,6 @@ SC_MODULE(Cache) {
         }
     }
 };
-
-
 
 SC_MODULE(CPU) {
     public:
@@ -224,7 +222,8 @@ SC_MODULE(CPU) {
                 Port_cacheFunc.write(f);
 
                 if (f == Cache::FUNC_WRITE) {
-                    VERBOSE && cout << sc_time_stamp() << ": CPU sends " << tr_data.addr << " write" << endl;
+                    cout << sc_time_stamp() << ": CPU sends " << tr_data.addr << " write" << endl;
+
                     // Don't have data, we write the address as the data value.
                     Port_cacheData.write(tr_data.addr);
                     wait();
@@ -232,17 +231,17 @@ SC_MODULE(CPU) {
                     Port_cacheData.write(float_64_bit_wire);
 
                 } else {
-                    VERBOSE && cout << sc_time_stamp() << ": CPU sends " << tr_data.addr << " read" << endl;
+                    cout << sc_time_stamp() << ": CPU sends " << tr_data.addr << " read" << endl;
                 }
 
                 wait(Port_cacheDone.value_changed_event());
 
                 if (f == Cache::FUNC_READ) {
-                    VERBOSE && cout << sc_time_stamp()
+                    cout << sc_time_stamp()
                          << ": CPU reads: " << Port_cacheData.read() << endl;
                 }
             } else {
-                VERBOSE && cout << sc_time_stamp() << ": CPU executes NOP" << endl;
+                cout << sc_time_stamp() << ": CPU executes NOP" << endl;
             }
 
             // Log cache hit 
@@ -273,6 +272,45 @@ SC_MODULE(CPU) {
     }
 };
 
+
+
+class Bus_if : public virtual sc_interface
+{
+public:
+    virtual bool read(uint64_t addr) = 0;
+    virtual bool write(uint64_t addr, uint64_t data) = 0;
+};
+
+class Bus : public Bus_if, public sc_module
+{
+public:
+    enum Function { FUNC_READ, FUNC_WRITE };
+
+    sc_in<bool> Port_CLK;
+    sc_signal_rv<64> Port_BusAddr;
+    sc_in<Function> Port_Func;
+
+private:
+    sc_signal_rv<64> *sc_signal_rv_procs;
+
+public:
+    SC_CTOR (Bus)
+    {
+        //sc_signal_rv_procs = (sc_signal_rv<64>*)malloc(sizeof(CacheLine) * );
+    }
+
+    virtual bool read(uint64_t addr)
+    {
+        Port_BusAddr.write(addr);
+        return true;
+    };
+
+    virtual bool write(uint64_t addr, uint64_t data)
+    {
+        Port_BusAddr.write(addr);
+        return true;
+    }
+};
 
 int sc_main(int argc, char *argv[]) {
     try {
