@@ -22,7 +22,7 @@ using namespace sc_core; // This pollutes namespace, better: only import what yo
 
 static const size_t MEM_SIZE = 2500;
 
-static const bool VERBOSE = false;
+static const bool VERBOSE = true;
 
 SC_MODULE(Memory) {
     public:
