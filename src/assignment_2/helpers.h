@@ -10,6 +10,8 @@ const int n_width = 7;
 
 using namespace std;
 
+enum Function { FUNC_READ, FUNC_WRITE };
+
 inline void log_rest() {
     cout << endl;
 }

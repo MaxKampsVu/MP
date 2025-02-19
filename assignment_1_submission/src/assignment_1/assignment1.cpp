@@ -187,7 +187,7 @@ SC_MODULE(CPU) {
     sc_in<bool> Port_CLK;
     sc_in<Cache::RetCode> Port_cacheDone;
     sc_in<Cache::RetStatusCode> Port_cacheStatus;
-    sc_out<Cache::Function> Port_cacheFunc;
+    sc_out<Function> Port_cacheFunc;
     sc_out<uint64_t> Port_cacheAddr;
     sc_inout_rv<64> Port_cacheData;
 
@@ -200,7 +200,7 @@ SC_MODULE(CPU) {
     private:
     void execute() {
         TraceFile::Entry tr_data;
-        Cache::Function f;
+        Function f;
 
 
         // Loop until end of tracefile
@@ -213,10 +213,10 @@ SC_MODULE(CPU) {
 
             switch (tr_data.type) {
                 case TraceFile::ENTRY_TYPE_READ:
-                    f = Cache::FUNC_READ; 
+                    f = FUNC_READ; 
                     break;
                 case TraceFile::ENTRY_TYPE_WRITE:
-                    f = Cache::FUNC_WRITE;
+                    f = FUNC_WRITE;
                     break;
                 case TraceFile::ENTRY_TYPE_NOP: 
                     break;
@@ -228,7 +228,7 @@ SC_MODULE(CPU) {
                 Port_cacheAddr.write(tr_data.addr);
                 Port_cacheFunc.write(f);
 
-                if (f == Cache::FUNC_WRITE) {
+                if (f == FUNC_WRITE) {
                     VERBOSE && cout << sc_time_stamp() << ": CPU sends " << tr_data.addr << " write" << endl;
                     // Don't have data, we write the address as the data value.
                     Port_cacheData.write(tr_data.addr);
@@ -242,7 +242,7 @@ SC_MODULE(CPU) {
 
                 wait(Port_cacheDone.value_changed_event());
 
-                if (f == Cache::FUNC_READ) {
+                if (f == FUNC_READ) {
                     VERBOSE && cout << sc_time_stamp()
                          << ": CPU reads: " << Port_cacheData.read() << endl;
                 }
@@ -303,7 +303,7 @@ int sc_main(int argc, char *argv[]) {
         CPU cpu("cpu");
 
         // Signals
-        sc_buffer<Cache::Function> sigcacheFunc;
+        sc_buffer<Function> sigcacheFunc;
         sc_buffer<Cache::RetCode> sigcacheDone;
         sc_buffer<Cache::RetStatusCode> sigcacheStatus;
         sc_signal<uint64_t> sigcacheAddr;

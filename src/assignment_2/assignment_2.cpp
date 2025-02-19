@@ -9,6 +9,7 @@
  
  #include "psa.h"
  #include "Memory.h"
+ #include "helpers.h"
  
  using namespace std;
  using namespace sc_core; // This pollutes namespace, better: only import what you need.
@@ -31,8 +32,6 @@ static bool VERBOSE = true; // Toggle logging
 
 SC_MODULE(Cache) {
     public:
-    enum Function { FUNC_READ, FUNC_WRITE };
-
     enum RetCode { RET_READ_DONE, RET_WRITE_DONE };
 
     enum RetStatusCode { RET_CACHE_MISS, RET_CACHE_HIT }; // Status code to signify to the cpu if the read/write cause a hit/miss 
@@ -44,11 +43,18 @@ SC_MODULE(Cache) {
     Memory *memory;
 
     sc_in<bool> Port_CLK;
+
+    //Ports to the CPU 
     sc_in<Function> Port_Func;
     sc_in<uint64_t> Port_Addr;
     sc_out<RetCode> Port_Done;
     sc_inout_rv<64> Port_Data;
     sc_out<RetStatusCode> Port_Status; // Wire for the hit/miss status code 
+
+    //Ports to Bus
+    sc_in<Function> Port_BusFunc;
+    sc_in<uint64_t> Port_BusAddr;
+    sc_in<uint64_t> Port_BusTransId;
 
     SC_CTOR(Cache) {
         SC_THREAD(execute);
@@ -207,7 +213,7 @@ SC_MODULE(CPU) {
     sc_in<bool> Port_CLK;
     sc_in<Cache::RetCode> Port_cacheDone;
     sc_in<Cache::RetStatusCode> Port_cacheStatus;
-    sc_out<Cache::Function> Port_cacheFunc;
+    sc_out<Function> Port_cacheFunc;
     sc_out<uint64_t> Port_cacheAddr;
     sc_inout_rv<64> Port_cacheData;
 
@@ -222,7 +228,7 @@ SC_MODULE(CPU) {
     private:
     void execute() {
         TraceFile::Entry tr_data;
-        Cache::Function f;
+        Function f;
 
         cout <<  ": CPU my_id " << my_id << endl;
 
@@ -236,10 +242,10 @@ SC_MODULE(CPU) {
 
             switch (tr_data.type) {
                 case TraceFile::ENTRY_TYPE_READ:
-                    f = Cache::FUNC_READ; 
+                    f = FUNC_READ; 
                     break;
                 case TraceFile::ENTRY_TYPE_WRITE:
-                    f = Cache::FUNC_WRITE;
+                    f = FUNC_WRITE;
                     break;
                 case TraceFile::ENTRY_TYPE_NOP: 
                     break;
@@ -252,7 +258,7 @@ SC_MODULE(CPU) {
                 Port_cacheFunc.write(f);
 
 
-                if (f == Cache::FUNC_WRITE) {
+                if (f == FUNC_WRITE) {
                     VERBOSE && cout << sc_time_stamp() << ": CPU sends " << tr_data.addr << " write" << endl;
                     // Don't have data, we write the address as the data value.
                     Port_cacheData.write(tr_data.addr);
@@ -266,7 +272,7 @@ SC_MODULE(CPU) {
 
                 wait(Port_cacheDone.value_changed_event());
 
-                if (f == Cache::FUNC_READ) {
+                if (f == FUNC_READ) {
                     VERBOSE && cout << sc_time_stamp()
                          << ": CPU reads: " << Port_cacheData.read() << endl;
                 }
@@ -302,39 +308,6 @@ SC_MODULE(CPU) {
     }
 };
 
-
-void init_modules() {
-    // Instantiate Modules
-    Cache cache("cache");
-    CPU cpu("cpu");
-
-    // Signals
-    sc_buffer<Cache::Function> sigcacheFunc;
-    sc_buffer<Cache::RetCode> sigcacheDone;
-    sc_buffer<Cache::RetStatusCode> sigcacheStatus;
-    sc_signal<uint64_t> sigcacheAddr;
-    sc_signal_rv<64> sigcacheData;
-
-    // The clock that will drive the CPU and cacheory
-    sc_clock clk;
-
-    // Connecting module ports with signals
-    cache.Port_Func(sigcacheFunc);
-    cache.Port_Addr(sigcacheAddr);
-    cache.Port_Data(sigcacheData);
-    cache.Port_Done(sigcacheDone);
-    cache.Port_Status(sigcacheStatus);
-
-    cpu.Port_cacheFunc(sigcacheFunc);
-    cpu.Port_cacheAddr(sigcacheAddr);
-    cpu.Port_cacheData(sigcacheData);
-    cpu.Port_cacheDone(sigcacheDone);
-    cpu.Port_cacheStatus(sigcacheStatus);
-
-    cache.Port_CLK(clk);
-    cpu.Port_CLK(clk);
-}
-
 int sc_main(int argc, char *argv[]) {
     try {
         // Get the tracefile argument and create Tracefile object
@@ -356,7 +329,7 @@ int sc_main(int argc, char *argv[]) {
         cout << "Running (press CTRL+C to interrupt)... " << endl;
         
             // Declare signals for all CPUs and caches
-        std::vector<sc_buffer<Cache::Function>*> sigcacheFunc(NUM_CPUS);
+        std::vector<sc_buffer<Function>*> sigcacheFunc(NUM_CPUS);
         std::vector<sc_buffer<Cache::RetCode>*> sigcacheDone(NUM_CPUS);
         std::vector<sc_buffer<Cache::RetStatusCode>*> sigcacheStatus(NUM_CPUS);
         std::vector<sc_signal<uint64_t>*> sigcacheAddr(NUM_CPUS);
@@ -370,6 +343,16 @@ int sc_main(int argc, char *argv[]) {
         sc_clock clk("clk", sc_time(1, SC_NS));
 
         Memory *memory = new Memory("memory");
+        memory->Port_CLK(clk);
+        //Ports for memory
+        //memory->Port_BusAddr.resize(NUM_CACHES);
+        //memory->Port_BusTransId.resize(NUM_CACHES); 
+        //Signals between memory and cache
+        
+        std::vector<sc_buffer<Function>*> sigbusFunc(NUM_CPUS);
+        std::vector<sc_signal<uint64_t>*> sigbusAddr(NUM_CPUS);
+        std::vector<sc_signal<uint64_t>*> sigbusTransId(NUM_CPUS);
+        
 
         // Initialize Cache and CPU modules, and connect them
         for (int i = 0; i < NUM_CPUS; i++) {
@@ -386,18 +369,30 @@ int sc_main(int argc, char *argv[]) {
             caches[i]->my_id = i;
 
             // Dynamically allocate the necessary signals for each CPU and Cache
-            sigcacheFunc[i] = new sc_buffer<Cache::Function>();
+            sigcacheFunc[i] = new sc_buffer<Function>();
             sigcacheDone[i] = new sc_buffer<Cache::RetCode>();
             sigcacheStatus[i] = new sc_buffer<Cache::RetStatusCode>();
             sigcacheAddr[i] = new sc_signal<uint64_t>();
             sigcacheData[i] = new sc_signal_rv<64>();
-
+            sigbusFunc[i] = new sc_buffer<Function>();
+            sigbusAddr[i] = new sc_signal<uint64_t>();
+            sigbusTransId[i] = new sc_signal<uint64_t>();
             // Connecting ports of Cache and CPU with the corresponding signals
             caches[i]->Port_Func(*sigcacheFunc[i]);
             caches[i]->Port_Addr(*sigcacheAddr[i]);
             caches[i]->Port_Data(*sigcacheData[i]);
             caches[i]->Port_Done(*sigcacheDone[i]);
             caches[i]->Port_Status(*sigcacheStatus[i]);
+
+            caches[i]->Port_BusFunc(*sigbusFunc[i]);
+            caches[i]->Port_BusAddr(*sigbusAddr[i]);
+            caches[i]->Port_BusTransId(*sigbusTransId[i]);
+            
+            
+            (*memory->Port_BusCacheFunc[i])(*sigbusFunc[i]);
+            (*memory->Port_BusCacheAddr[i])(*sigbusAddr[i]);
+            (*memory->Port_BusCacheTransId[i])(*sigbusTransId[i]);
+            
 
             cpus[i]->Port_cacheFunc(*sigcacheFunc[i]);
             cpus[i]->Port_cacheAddr(*sigcacheAddr[i]);
