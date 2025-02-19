@@ -8,64 +8,13 @@
  #define SC_ALLOW_DEPRECATED_IEEE_API
  
  #include "psa.h"
+ #include "Memory.h"
  
  using namespace std;
  using namespace sc_core; // This pollutes namespace, better: only import what you need.
 
 static const size_t NUM_CPUS = 2;
 
-SC_MODULE(BUS) {
-    enum Function { FUNC_READ, FUNC_WRITE };
-    public:
-    sc_in<bool> Port_CLK;
-    sc_inout<Function> *Port_cacheFunc;
-    sc_inout<uint64_t> *Port_cacheAddr;
-
-    SC_CTOR(BUS) {
-        SC_THREAD(execute);
-        sensitive << Port_CLK.pos();
-        dont_initialize();
-    }
-
-    private:
-
-    void broadcast_access(uint64_t addr, Function func) {
-        for (int i = 0; i < NUM_CPUS; i++) {
-            Port_cacheFunc[i].write(func);
-            Port_cacheAddr[i].write(addr);
-        }
-    }
-
-    void execute() {
-        sc_event_or_list ev_list;
-        for (int i = 0; i < NUM_CPUS; i++) {
-            ev_list |= Port_cacheFunc[i].value_changed_event();
-        }
-
-        Function prev_values[NUM_CPUS];
-
-        for (int i = 0; i < NUM_CPUS; i++) {
-            prev_values[i] = Port_cacheFunc[i].read();
-        }
-
-        while(true) {
-            wait(ev_list);
-
-            for (int i = 0; i < NUM_CPUS; i++) {
-                Function new_value = Port_cacheFunc[i].read();
-                if (new_value != prev_values[i]) {  // Detect change
-                    std::cout << "Signal Port_cacheFunc[" << i << "] changed to " 
-                              << new_value << " at time " << sc_time_stamp() << std::endl;
-    
-                    prev_values[i] = new_value;  // Update stored value
-                }
-            }
-
-        }
-        
-
-    }
-};
 
 struct CacheLine {
     uint64_t tag; // Stores the block adress
@@ -87,6 +36,12 @@ SC_MODULE(Cache) {
     enum RetCode { RET_READ_DONE, RET_WRITE_DONE };
 
     enum RetStatusCode { RET_CACHE_MISS, RET_CACHE_HIT }; // Status code to signify to the cpu if the read/write cause a hit/miss 
+
+    uint64_t my_id;
+
+    uint64_t trans_id = 0;
+
+    Memory *memory;
 
     sc_in<bool> Port_CLK;
     sc_in<Function> Port_Func;
@@ -168,39 +123,49 @@ SC_MODULE(Cache) {
 
 
     // Inserts a CacheLine into a set and evicts a coliding cache line if necessary
-    void allocate(CacheLine *c_set, uint64_t block_addr, uint64_t index, bool is_write) {
+    void allocate(CacheLine *c_set, uint64_t block_addr, uint64_t addr, uint64_t index, bool is_write) {
         if(c_set[index].tag != block_addr && c_set[index].valid) { // evict element
             VERBOSE && cout << sc_time_stamp() << ": Cache evicts " << c_set[index].tag << endl;
             if(c_set[index].dirty) { // writeback if dirty
-                wait(100); 
+                memory->write(addr, trans_id);
+                trans_id += NUM_CPUS;
                 VERBOSE && cout << sc_time_stamp() << ": Cache write back dirty block_addr " << c_set[index].tag << " to main" << endl;
             }
         }
-        wait(100); 
+        memory->read(addr, trans_id);
+        trans_id += NUM_CPUS;
         c_set[index] = (CacheLine) {.tag = block_addr, .lu_time = sc_time_stamp().to_double(), .valid = true, .dirty = is_write};
         VERBOSE && cout << sc_time_stamp() << ": Cache writes " << c_set[index].tag << endl;
     }
 
-    void write_cache(CacheLine *c_set, uint64_t block_addr, uint64_t index) {
+
+    void block() {
+        while(true) {
+            
+        }
+    }
+
+    void write_cache(CacheLine *c_set, uint64_t block_addr, uint64_t addr, uint64_t index) {
         if (c_set[index].tag == block_addr && c_set[index].valid) { // Cache hit 
             refresh_lu_time(c_set, block_addr, index);
             c_set[index].dirty = true;
             wait(1);
         } else { // Load block_addr from main memory and evict if necessary 
-            allocate(c_set, block_addr, index, true);
+            allocate(c_set, block_addr, addr, index, true);
         }
     }
 
-    void read_cache(CacheLine *c_set, uint64_t block_addr, uint64_t index) {
+    void read_cache(CacheLine *c_set, uint64_t block_addr, uint64_t addr, uint64_t index) {
         if (c_set[index].tag == block_addr && c_set[index].valid) { // Cache hit 
             refresh_lu_time(c_set, block_addr, index);
             wait(1);
         } else { // Load block_addr from main memory and evict if necessary 
-            allocate(c_set, block_addr, index, false);
+            allocate(c_set, block_addr, addr, index, false);
         }
     }
 
     void execute() {
+        trans_id = my_id;
         while (true) {
             wait(Port_Func.value_changed_event());
 
@@ -218,9 +183,9 @@ SC_MODULE(Cache) {
             uint64_t index = probe_cache(c_set, block_addr); 
             if (f == FUNC_WRITE) {
                 data = Port_Data.read().to_uint64();
-                write_cache(c_set, block_addr, index);
+                write_cache(c_set, block_addr, addr, index);
             } else {
-                read_cache(c_set, block_addr, index);
+                read_cache(c_set, block_addr, addr, index);
             }
 
             if (f == FUNC_READ) {
@@ -246,7 +211,7 @@ SC_MODULE(CPU) {
     sc_out<uint64_t> Port_cacheAddr;
     sc_inout_rv<64> Port_cacheData;
 
-    int id;
+    int my_id;
 
     SC_CTOR(CPU) {
         SC_THREAD(execute);
@@ -259,12 +224,12 @@ SC_MODULE(CPU) {
         TraceFile::Entry tr_data;
         Cache::Function f;
 
-        cout <<  ": CPU id " << id << endl;
+        cout <<  ": CPU my_id " << my_id << endl;
 
         // Loop until end of tracefile
         while (!tracefile_ptr->eof()) {
             // Get the next action for the processor in the trace
-            if (!tracefile_ptr->next(0, tr_data)) {
+            if (!tracefile_ptr->next(my_id, tr_data)) {
                 cerr << "Error reading trace for CPU" << endl;
                 break;
             }
@@ -315,15 +280,15 @@ SC_MODULE(CPU) {
             switch (tr_data.type) {
                 case TraceFile::ENTRY_TYPE_READ:
                     if (j)
-                        stats_readhit(0);
+                        stats_readhit(my_id);
                     else
-                        stats_readmiss(0);
+                        stats_readmiss(my_id);
                     break;
                 case TraceFile::ENTRY_TYPE_WRITE:
                     if (j)
-                        stats_writehit(0);
+                        stats_writehit(my_id);
                     else
-                        stats_writemiss(0);
+                        stats_writemiss(my_id);
                     break;
                 default: break;
             }
@@ -389,7 +354,7 @@ int sc_main(int argc, char *argv[]) {
         stats_init();
 
         cout << "Running (press CTRL+C to interrupt)... " << endl;
-
+        
             // Declare signals for all CPUs and caches
         std::vector<sc_buffer<Cache::Function>*> sigcacheFunc(NUM_CPUS);
         std::vector<sc_buffer<Cache::RetCode>*> sigcacheDone(NUM_CPUS);
@@ -404,6 +369,8 @@ int sc_main(int argc, char *argv[]) {
         // Clock signal shared by all modules
         sc_clock clk("clk", sc_time(1, SC_NS));
 
+        Memory *memory = new Memory("memory");
+
         // Initialize Cache and CPU modules, and connect them
         for (int i = 0; i < NUM_CPUS; i++) {
             std::string cache_name = "cache_" + std::to_string(i);
@@ -411,9 +378,12 @@ int sc_main(int argc, char *argv[]) {
 
             // Dynamically allocate Cache and CPU
             caches[i] = new Cache(cache_name.c_str());
+            caches[i]->memory = memory;
+
             cpus[i] = new CPU(cpu_name.c_str());
 
-            cpus[i]->id = i;
+            cpus[i]->my_id = i;
+            caches[i]->my_id = i;
 
             // Dynamically allocate the necessary signals for each CPU and Cache
             sigcacheFunc[i] = new sc_buffer<Cache::Function>();
