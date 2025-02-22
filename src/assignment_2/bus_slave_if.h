@@ -8,8 +8,8 @@
  * communicate directly with the memory. */
 class bus_slave_if : public virtual sc_interface {
     public:
-    virtual int read(uint64_t addr, uint64_t trans_id) = 0;
-    virtual int write(uint64_t addr, uint64_t trans_id) = 0;
+    virtual void read(uint64_t addr, uint64_t trans_id, uint64_t cache_id) = 0;
+    virtual void write(uint64_t addr, uint64_t trans_id, uint64_t cache_id) = 0;
 };
 
 #endif

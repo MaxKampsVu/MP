@@ -10,7 +10,9 @@ const int n_width = 7;
 
 using namespace std;
 
-enum Function { FUNC_READ, FUNC_WRITE };
+enum Function {FUNC_READ, FUNC_WRITE, FUNC_NOP};
+
+static size_t NUM_CPUS; 
 
 inline void log_rest() {
     cout << endl;

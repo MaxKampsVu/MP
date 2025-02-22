@@ -14,8 +14,6 @@
  using namespace std;
  using namespace sc_core; // This pollutes namespace, better: only import what you need.
 
-static const size_t NUM_CPUS = 2;
-
 
 struct CacheLine {
     uint64_t tag; // Stores the block adress
@@ -30,26 +28,24 @@ static const size_t LINE_SIZE = 32; // Byte
 static const size_t N_SETS = (CACHE_SIZE / LINE_SIZE) / SET_ASSOC; 
 static bool VERBOSE = true; // Toggle logging  
 
+static int bus_lock = 0;
+static uint64_t trans_id = 1;
+
 SC_MODULE(Cache) {
     public:
-    enum RetCode { RET_READ_DONE, RET_WRITE_DONE };
-
-    enum RetStatusCode { RET_CACHE_MISS, RET_CACHE_HIT }; // Status code to signify to the cpu if the read/write cause a hit/miss 
+    enum RetCode {RET_READ_DONE, RET_WRITE_DONE, RET_NOP_DONE};
 
     uint64_t my_id;
-
-    uint64_t trans_id = 0;
 
     Memory *memory;
 
     sc_in<bool> Port_CLK;
 
-    //Ports to the CPU 
+    //Ports to the CPU  
     sc_in<Function> Port_Func;
     sc_in<uint64_t> Port_Addr;
     sc_out<RetCode> Port_Done;
     sc_inout_rv<64> Port_Data;
-    sc_out<RetStatusCode> Port_Status; // Wire for the hit/miss status code 
 
     //Ports to Bus
     sc_in<Function> Port_BusFunc;
@@ -89,6 +85,7 @@ SC_MODULE(Cache) {
 
     private:
     CacheLine **line_table; // Array of Sets with size SET_ASSOC (e.g. 8 for an 8-way set-associative cache)
+    uint64_t prev_trans_id = 0;
 
     // Returns the index in a cache set into which a new address should be inserted to and informs the cpu about a hit/miss
     uint64_t probe_cache(CacheLine *c_set, uint64_t block_addr) {
@@ -102,8 +99,6 @@ SC_MODULE(Cache) {
                min_lu_time = 0;
             }
             else if(c_set[i].tag == block_addr) { // If a cache hit is found return immidiately  
-                VERBOSE && cout << sc_time_stamp() << ": Cache hit" << endl;
-                Port_Status.write(RET_CACHE_HIT);
                 return i;
             }
 
@@ -116,62 +111,144 @@ SC_MODULE(Cache) {
         }
 
         // Cache miss 
-        VERBOSE && cout << sc_time_stamp() << ": Cache miss, fetching from main" << endl;
-        Port_Status.write(RET_CACHE_MISS);
         return min_lu_index;
     }
 
     // Refreshes the last recently used time
-    void refresh_lu_time(CacheLine *c_set, uint64_t block_addr, uint64_t index) {
+    void refresh_lu_time(CacheLine *c_set, uint64_t block_addr, uint64_t addr, uint64_t index) {
         c_set[index].lu_time = sc_time_stamp().to_double(); // Refresh last used time
-        VERBOSE && cout << sc_time_stamp() << ": Cache refreshes last used time of " << block_addr << " to " << sc_time_stamp() << endl;
+        log(name(), "refresh last used time of addr", addr);
     }
 
 
-    // Inserts a CacheLine into a set and evicts a coliding cache line if necessary
+    // Inserts a CacheLine into a set and evicts a colliding cache line if necessary
     void allocate(CacheLine *c_set, uint64_t block_addr, uint64_t addr, uint64_t index, bool is_write) {
         if(c_set[index].tag != block_addr && c_set[index].valid) { // evict element
-            VERBOSE && cout << sc_time_stamp() << ": Cache evicts " << c_set[index].tag << endl;
-            if(c_set[index].dirty) { // writeback if dirty
-                memory->write(addr, trans_id);
-                trans_id += NUM_CPUS;
-                VERBOSE && cout << sc_time_stamp() << ": Cache write back dirty block_addr " << c_set[index].tag << " to main" << endl;
-            }
+            log(name(), "evict block_addr: ", c_set[index].tag);
         }
-        memory->read(addr, trans_id);
-        trans_id += NUM_CPUS;
         c_set[index] = (CacheLine) {.tag = block_addr, .lu_time = sc_time_stamp().to_double(), .valid = true, .dirty = is_write};
-        VERBOSE && cout << sc_time_stamp() << ": Cache writes " << c_set[index].tag << endl;
     }
 
+    void invalidate() {
+        uint64_t addr_bus = Port_BusAddr.read();
+        Function func_bus = Port_BusFunc.read();
+        uint64_t trans_id = Port_BusTransId.read();
+        
+        log(name(), "Snooped bus addr", addr_bus);
 
-    void block() {
-        while(true) {
-            
+        uint64_t block_addr = addr_bus / LINE_SIZE;
+
+        // Determine cache set for block_addr
+        size_t set_index = block_addr % N_SETS;
+        CacheLine *c_set = line_table[set_index];
+
+        // Find the index in the c_set at which cache line should be manipulated (in case of a hit) / inserted (in case of a miss)
+        uint64_t index = probe_cache(c_set, block_addr); 
+
+        //Invalidate block if it is present in cache 
+        if(c_set[index].tag == block_addr && c_set[index].valid && func_bus == FUNC_WRITE) {
+            c_set[index].valid = false;
+            log(name(), "Invalidated addr", addr_bus);
+        }
+    }
+
+    void wait_and_invalidate() {
+        wait(Port_BusTransId.value_changed_event());
+        uint64_t trans_id = Port_BusTransId.read();
+        if(prev_trans_id != trans_id) {
+            prev_trans_id = trans_id;
+            invalidate();
+        }
+    }
+
+    void mem_read(uint64_t addr) {
+        memory->read(addr, trans_id, my_id);
+        trans_id += 1;
+    }
+    
+    void mem_write(uint64_t addr) {
+        memory->write(addr, trans_id, my_id);
+        trans_id += 1;
+    }
+
+    void nop_cache() {
+        while (bus_lock != my_id) {
+            wait_and_invalidate();
+        }
+
+        cout << "--------- Cache id " << my_id << " aquired the bus ---------" << endl;
+        log(name(), "NOP, do nothing");
+        bus_lock = (bus_lock + 1) % num_cpus;
+
+        while(bus_lock != 0) {
+            wait_and_invalidate();
         }
     }
 
     void write_cache(CacheLine *c_set, uint64_t block_addr, uint64_t addr, uint64_t index) {
+        while (bus_lock != my_id) {
+            wait_and_invalidate();
+        }
+
+        cout << "--------- Cache id " << my_id << " aquired the bus ---------" << endl;
         if (c_set[index].tag == block_addr && c_set[index].valid) { // Cache hit 
-            refresh_lu_time(c_set, block_addr, index);
-            c_set[index].dirty = true;
+            log(name(), "Cache write hit");
+            stats_writehit(my_id);
             wait(1);
-        } else { // Load block_addr from main memory and evict if necessary 
+            refresh_lu_time(c_set, block_addr, addr, index);
+        } else {
+            log(name(), "Cache miss, request read from bus for addr", addr);
+            stats_writemiss(my_id);
+            mem_read(addr);
+            wait(Port_BusTransId.value_changed_event());
+            wait(100);
+            log(name(), "reads on bus addr", addr);
             allocate(c_set, block_addr, addr, index, true);
+        }
+        log(name(), "finished write to cache", addr);
+        log(name(), "request bus to write back to memory", addr);
+        mem_write(addr);
+        wait(Port_BusTransId.value_changed_event());
+        log(name(), "finished write back to memory of addr", addr);
+
+        bus_lock = (bus_lock + 1) % num_cpus;
+
+        while(bus_lock != 0) {
+            wait_and_invalidate();
         }
     }
 
     void read_cache(CacheLine *c_set, uint64_t block_addr, uint64_t addr, uint64_t index) {
+        uint64_t prev_trans_id = 0;
+        while (bus_lock != my_id) {
+            wait_and_invalidate();
+        }
+
+        cout << "--------- Cache id " << my_id << " aquired the bus ---------" << endl;
         if (c_set[index].tag == block_addr && c_set[index].valid) { // Cache hit 
-            refresh_lu_time(c_set, block_addr, index);
+            log(name(), "Cache read hit");
+            stats_readhit(my_id);
             wait(1);
+            refresh_lu_time(c_set, block_addr, addr, index);
         } else { // Load block_addr from main memory and evict if necessary 
+            log(name(), "Cache miss, request read from bus for addr", addr);
+            stats_readmiss(my_id);
+            mem_read(addr);
+            wait(Port_BusTransId.value_changed_event());
+            wait(100);
+            log(name(), "reads on bus addr", addr);
             allocate(c_set, block_addr, addr, index, false);
+        }
+
+        bus_lock = (bus_lock + 1) % num_cpus;
+
+        while(bus_lock != 0) {
+            wait_and_invalidate();
         }
     }
 
     void execute() {
-        trans_id = my_id;
+        trans_id = my_id + 1;
         while (true) {
             wait(Port_Func.value_changed_event());
 
@@ -190,8 +267,10 @@ SC_MODULE(Cache) {
             if (f == FUNC_WRITE) {
                 data = Port_Data.read().to_uint64();
                 write_cache(c_set, block_addr, addr, index);
-            } else {
+            } else if (f == FUNC_READ) {
                 read_cache(c_set, block_addr, addr, index);
+            } else {
+                nop_cache();
             }
 
             if (f == FUNC_READ) {
@@ -199,8 +278,10 @@ SC_MODULE(Cache) {
                 Port_Done.write(RET_READ_DONE);
                 wait();
                 Port_Data.write(float_64_bit_wire); // string with 64 "Z"'s
-            } else {
+            } else if (f == FUNC_READ) {
                 Port_Done.write(RET_WRITE_DONE);
+            } else {
+                Port_Done.write(RET_NOP_DONE);
             }
         }
     }
@@ -212,7 +293,6 @@ SC_MODULE(CPU) {
     public:
     sc_in<bool> Port_CLK;
     sc_in<Cache::RetCode> Port_cacheDone;
-    sc_in<Cache::RetStatusCode> Port_cacheStatus;
     sc_out<Function> Port_cacheFunc;
     sc_out<uint64_t> Port_cacheAddr;
     sc_inout_rv<64> Port_cacheData;
@@ -230,16 +310,19 @@ SC_MODULE(CPU) {
         TraceFile::Entry tr_data;
         Function f;
 
-        cout <<  ": CPU my_id " << my_id << endl;
-
         // Loop until end of tracefile
         while (!tracefile_ptr->eof()) {
+
             // Get the next action for the processor in the trace
             if (!tracefile_ptr->next(my_id, tr_data)) {
                 cerr << "Error reading trace for CPU" << endl;
                 break;
             }
 
+            if(tracefile_ptr->eof()) {
+                sc_stop();
+            }
+            
             switch (tr_data.type) {
                 case TraceFile::ENTRY_TYPE_READ:
                     f = FUNC_READ; 
@@ -247,62 +330,34 @@ SC_MODULE(CPU) {
                 case TraceFile::ENTRY_TYPE_WRITE:
                     f = FUNC_WRITE;
                     break;
-                case TraceFile::ENTRY_TYPE_NOP: 
+                case TraceFile::ENTRY_TYPE_NOP:
+                    f = FUNC_NOP;
                     break;
                 default: cerr << "Error, got invalid data from Trace" << endl; exit(0);
             }
-            
 
-            if (tr_data.type != TraceFile::ENTRY_TYPE_NOP) {
-                Port_cacheAddr.write(tr_data.addr);
-                Port_cacheFunc.write(f);
+            Port_cacheAddr.write(tr_data.addr);
+            Port_cacheFunc.write(f);
 
+            if (f == FUNC_WRITE) {
+                log(name(), "(*) sends write for addr", tr_data.addr);
+                // Don't have data, we write the address as the data value.
+                Port_cacheData.write(tr_data.addr);
+                wait();
+                // Now float the data wires with 64 "Z"'s
+                Port_cacheData.write(float_64_bit_wire);
 
-                if (f == FUNC_WRITE) {
-                    VERBOSE && cout << sc_time_stamp() << ": CPU sends " << tr_data.addr << " write" << endl;
-                    // Don't have data, we write the address as the data value.
-                    Port_cacheData.write(tr_data.addr);
-                    wait();
-                    // Now float the data wires with 64 "Z"'s
-                    Port_cacheData.write(float_64_bit_wire);
-
-                } else {
-                    VERBOSE && cout << sc_time_stamp() << ": CPU sends " << tr_data.addr << " read" << endl;
-                }
-
-                wait(Port_cacheDone.value_changed_event());
-
-                if (f == FUNC_READ) {
-                    VERBOSE && cout << sc_time_stamp()
-                         << ": CPU reads: " << Port_cacheData.read() << endl;
-                }
+            } else if (f == FUNC_READ) {
+                log(name(), "(*) sends read for addr", tr_data.addr);
             } else {
-                VERBOSE && cout << sc_time_stamp() << ": CPU executes NOP" << endl;
+                log(name(), "(*) CPU executes NOP");
+                Port_cacheFunc.write(f);
             }
+            wait(Port_cacheDone.value_changed_event());
 
-            // Log cache hit 
-            int j = Port_cacheStatus.read();
-
-            switch (tr_data.type) {
-                case TraceFile::ENTRY_TYPE_READ:
-                    if (j)
-                        stats_readhit(my_id);
-                    else
-                        stats_readmiss(my_id);
-                    break;
-                case TraceFile::ENTRY_TYPE_WRITE:
-                    if (j)
-                        stats_writehit(my_id);
-                    else
-                        stats_writemiss(my_id);
-                    break;
-                default: break;
-            }
-
-            // Advance one cycle in simulated time
             wait();
         }
-
+        
         // Finished the Tracefile, now stop the simulation
         sc_stop();
     }
@@ -313,15 +368,16 @@ int sc_main(int argc, char *argv[]) {
         // Get the tracefile argument and create Tracefile object
         // This function sets tracefile_ptr and num_cpus
 
-
         if (argc == 3) {   
             VERBOSE = std::stoi(argv[2]) != 0;
         } else if (argc != 2) {
             throw std::invalid_argument("Usage: ./assignment_1.bin [trace_file] [verbose (0 or 1)] or \n ./assignment_1.bin [trace_file]");
         }
-
     
         init_tracefile(&argc, &argv);
+
+        NUM_CPUS = tracefile_ptr->get_proc_count();
+        cout << "Executing with " << NUM_CPUS << "CPUS" << endl;
 
         // Initialize statistics counters
         stats_init();
@@ -331,7 +387,6 @@ int sc_main(int argc, char *argv[]) {
             // Declare signals for all CPUs and caches
         std::vector<sc_buffer<Function>*> sigcacheFunc(NUM_CPUS);
         std::vector<sc_buffer<Cache::RetCode>*> sigcacheDone(NUM_CPUS);
-        std::vector<sc_buffer<Cache::RetStatusCode>*> sigcacheStatus(NUM_CPUS);
         std::vector<sc_signal<uint64_t>*> sigcacheAddr(NUM_CPUS);
         std::vector<sc_signal_rv<64>*> sigcacheData(NUM_CPUS);
 
@@ -344,14 +399,12 @@ int sc_main(int argc, char *argv[]) {
 
         Memory *memory = new Memory("memory");
         memory->Port_CLK(clk);
-        //Ports for memory
-        //memory->Port_BusAddr.resize(NUM_CACHES);
-        //memory->Port_BusTransId.resize(NUM_CACHES); 
+
+
         //Signals between memory and cache
-        
         std::vector<sc_buffer<Function>*> sigbusFunc(NUM_CPUS);
         std::vector<sc_signal<uint64_t>*> sigbusAddr(NUM_CPUS);
-        std::vector<sc_signal<uint64_t>*> sigbusTransId(NUM_CPUS);
+        std::vector<sc_buffer<uint64_t>*> sigbusTransId(NUM_CPUS);
         
 
         // Initialize Cache and CPU modules, and connect them
@@ -371,34 +424,30 @@ int sc_main(int argc, char *argv[]) {
             // Dynamically allocate the necessary signals for each CPU and Cache
             sigcacheFunc[i] = new sc_buffer<Function>();
             sigcacheDone[i] = new sc_buffer<Cache::RetCode>();
-            sigcacheStatus[i] = new sc_buffer<Cache::RetStatusCode>();
             sigcacheAddr[i] = new sc_signal<uint64_t>();
             sigcacheData[i] = new sc_signal_rv<64>();
             sigbusFunc[i] = new sc_buffer<Function>();
             sigbusAddr[i] = new sc_signal<uint64_t>();
-            sigbusTransId[i] = new sc_signal<uint64_t>();
+            sigbusTransId[i] = new sc_buffer<uint64_t>();
+
             // Connecting ports of Cache and CPU with the corresponding signals
             caches[i]->Port_Func(*sigcacheFunc[i]);
             caches[i]->Port_Addr(*sigcacheAddr[i]);
             caches[i]->Port_Data(*sigcacheData[i]);
             caches[i]->Port_Done(*sigcacheDone[i]);
-            caches[i]->Port_Status(*sigcacheStatus[i]);
 
             caches[i]->Port_BusFunc(*sigbusFunc[i]);
             caches[i]->Port_BusAddr(*sigbusAddr[i]);
             caches[i]->Port_BusTransId(*sigbusTransId[i]);
-            
-            
+
             (*memory->Port_BusCacheFunc[i])(*sigbusFunc[i]);
             (*memory->Port_BusCacheAddr[i])(*sigbusAddr[i]);
             (*memory->Port_BusCacheTransId[i])(*sigbusTransId[i]);
-            
 
             cpus[i]->Port_cacheFunc(*sigcacheFunc[i]);
             cpus[i]->Port_cacheAddr(*sigcacheAddr[i]);
             cpus[i]->Port_cacheData(*sigcacheData[i]);
             cpus[i]->Port_cacheDone(*sigcacheDone[i]);
-            cpus[i]->Port_cacheStatus(*sigcacheStatus[i]);
 
             // Connect clock signal to both Cache and CPU
             caches[i]->Port_CLK(clk);
@@ -410,8 +459,8 @@ int sc_main(int argc, char *argv[]) {
 
         // Print statistics after simulation finished
         stats_print();
-        //cache.dump(); // Uncomment to dump cacheory to stdout.
-      
+
+        memory->stats_print();
     }
     catch (exception &e) {
         cerr << e.what() << endl;

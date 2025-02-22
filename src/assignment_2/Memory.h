@@ -4,6 +4,7 @@
 
 #include <iostream>
 #include <systemc.h>
+#include <queue>
 
 #include "bus_slave_if.h"
 #include "helpers.h"
@@ -11,34 +12,43 @@
 using namespace std;
 using namespace sc_core; // This pollutes namespace, better: only import what you nee
 
-static size_t NUM_CACHES;
+static bool test = true;
+
+static sc_time totalaqtime = sc_time_stamp();
+static int totalwritereq = 0;
+static int totalreadreq = 0;
+
+struct request {
+    uint64_t addr; 
+    Function func; 
+    uint64_t trans_id;
+    uint64_t cache_id;
+};
 
 class Memory : public bus_slave_if, public sc_module {
     public:
-
+    
     sc_in<bool> Port_CLK;
     // Connections to caches
     std::vector<sc_out<Function>*> Port_BusCacheFunc;
     std::vector<sc_out<uint64_t>*> Port_BusCacheAddr;
     std::vector<sc_out<uint64_t>*> Port_BusCacheTransId;
 
-
+    queue<request> request_queue;
+    std::vector<int64_t> cache_list;
+    bool EOF_CPU = false;
+    
     SC_CTOR(Memory) {
         SC_THREAD(execute);
         sensitive << Port_CLK.pos();
         dont_initialize();
 
-        init_ports(2);
-    }
+        Port_BusCacheFunc.resize(NUM_CPUS);
+        Port_BusCacheAddr.resize(NUM_CPUS);
+        Port_BusCacheTransId.resize(NUM_CPUS);
 
-    void init_ports(uint64_t NUM_CPUS) {
-        NUM_CACHES = NUM_CPUS;
-        Port_BusCacheFunc.resize(NUM_CACHES);
-        Port_BusCacheAddr.resize(NUM_CACHES);
-        Port_BusCacheTransId.resize(NUM_CACHES);
-
-        for (int i = 0; i < NUM_CACHES; i++) {
-            Port_BusCacheFunc[i] = new sc_out<Function>();  // Allocate memory
+        for (int i = 0; i < NUM_CPUS; i++) {
+            Port_BusCacheFunc[i] = new sc_out<Function>();  
             Port_BusCacheAddr[i] = new sc_out<uint64_t>();
             Port_BusCacheTransId[i] = new sc_out<uint64_t>();
         }
@@ -49,23 +59,46 @@ class Memory : public bus_slave_if, public sc_module {
     }
 
     void execute() {
+        request req;
+        while (true) {
+            wait(Port_CLK.value_changed_event());
 
+            // Select newest request
+            if(!request_queue.empty()) {
+                req = request_queue.front(); 
+                request_queue.pop();
+            }
+
+            // Broadcast the request for snooping 
+            for(int i = 0; i < NUM_CPUS; i++) {
+                Port_BusCacheTransId[i]->write(req.trans_id);
+                Port_BusCacheAddr[i]->write(req.addr);
+                Port_BusCacheFunc[i]->write(req.func);
+            } 
+    
+        }
     }
 
-    int read(uint64_t addr, uint64_t trans_id) {
+    void read(uint64_t addr, uint64_t trans_id, uint64_t cache_id) {
         assert((addr & 0x3) == 0);
-        log(name(), "Transaction id: ", trans_id);
-        log(name(), "read from address", addr);
-        wait(100);
-        return 0;
+        totalreadreq += 1;
+        log(name(), "       received read request for addr", addr);
+        request_queue.push((request) {.addr = addr, .func = FUNC_READ, .trans_id = trans_id, .cache_id = cache_id});
     }
 
-    int write(uint64_t addr, uint64_t trans_id) {
+    void write(uint64_t addr, uint64_t trans_id, uint64_t cache_id) {
         assert((addr & 0x3) == 0);
-        log(name(), "Transaction id: ", trans_id);
-        log(name(), "write to address", addr);
-        wait(100);
-        return 0;
-    }    
+        totalwritereq += 1;
+        log(name(), "       received write request for addr", addr);
+        request_queue.push((request) {.addr = addr, .func = FUNC_WRITE, .cache_id = cache_id, .trans_id = trans_id});
+    } 
+
+    void stats_print() {
+        cout << "Memory reads: " << totalreadreq << endl;
+        cout << "Memory writes: " << totalwritereq << endl;
+        cout << "Total aquisition time: " << totalaqtime << endl;
+        cout << "Average aquisition time: " << totalaqtime / (totalreadreq + totalwritereq)  << endl;
+    }
 };
 #endif
+
