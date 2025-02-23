@@ -26,7 +26,6 @@ static const size_t CACHE_SIZE = 32768; // Byte
 static const size_t SET_ASSOC = 8;
 static const size_t LINE_SIZE = 32; // Byte 
 static const size_t N_SETS = (CACHE_SIZE / LINE_SIZE) / SET_ASSOC; 
-static bool VERBOSE = true; // Toggle logging  
 
 static int bus_lock = 0;
 static uint64_t trans_id = 1;
@@ -41,6 +40,8 @@ SC_MODULE(Cache) {
 
     sc_in<bool> Port_CLK;
 
+    double num_requests_before_me = 0;
+
     //Ports to the CPU  
     sc_in<Function> Port_Func;
     sc_in<uint64_t> Port_Addr;
@@ -51,6 +52,7 @@ SC_MODULE(Cache) {
     sc_in<Function> Port_BusFunc;
     sc_in<uint64_t> Port_BusAddr;
     sc_in<uint64_t> Port_BusTransId;
+    sc_in<uint64_t> Port_BusCacheId;
 
     SC_CTOR(Cache) {
         SC_THREAD(execute);
@@ -117,14 +119,14 @@ SC_MODULE(Cache) {
     // Refreshes the last recently used time
     void refresh_lu_time(CacheLine *c_set, uint64_t block_addr, uint64_t addr, uint64_t index) {
         c_set[index].lu_time = sc_time_stamp().to_double(); // Refresh last used time
-        log(name(), "refresh last used time of addr", addr);
+        VERBOSE ? log(name(), "refresh last used time of addr", addr) : (void)0;
     }
 
 
     // Inserts a CacheLine into a set and evicts a colliding cache line if necessary
     void allocate(CacheLine *c_set, uint64_t block_addr, uint64_t addr, uint64_t index, bool is_write) {
         if(c_set[index].tag != block_addr && c_set[index].valid) { // evict element
-            log(name(), "evict block_addr: ", c_set[index].tag);
+            VERBOSE ? log(name(), "evict block_addr: ", c_set[index].tag) : (void)0;
         }
         c_set[index] = (CacheLine) {.tag = block_addr, .lu_time = sc_time_stamp().to_double(), .valid = true, .dirty = is_write};
     }
@@ -134,7 +136,7 @@ SC_MODULE(Cache) {
         Function func_bus = Port_BusFunc.read();
         uint64_t trans_id = Port_BusTransId.read();
         
-        log(name(), "Snooped bus addr", addr_bus);
+        VERBOSE ? log(name(), "Snooped bus addr", addr_bus) : (void)0;
 
         uint64_t block_addr = addr_bus / LINE_SIZE;
 
@@ -148,14 +150,17 @@ SC_MODULE(Cache) {
         //Invalidate block if it is present in cache 
         if(c_set[index].tag == block_addr && c_set[index].valid && func_bus == FUNC_WRITE) {
             c_set[index].valid = false;
-            log(name(), "Invalidated addr", addr_bus);
+            VERBOSE ? log(name(), "Invalidated addr", addr_bus) : (void)0;
         }
     }
 
     void wait_and_invalidate() {
         wait(Port_BusTransId.value_changed_event());
         uint64_t trans_id = Port_BusTransId.read();
-        if(prev_trans_id != trans_id) {
+        uint64_t cache_id = Port_BusCacheId.read();
+        //cout << cache_id << endl;
+        if(prev_trans_id != trans_id && cache_id != my_id) {
+            num_requests_before_me++;
             prev_trans_id = trans_id;
             invalidate();
         }
@@ -176,8 +181,8 @@ SC_MODULE(Cache) {
             wait_and_invalidate();
         }
 
-        cout << "--------- Cache id " << my_id << " aquired the bus ---------" << endl;
-        log(name(), "NOP, do nothing");
+        VERBOSE && cout << "--------- Cache id " << my_id << " acquired the bus ---------" << endl;
+        VERBOSE ? log(name(), "NOP, do nothing") : (void)0;
         bus_lock = (bus_lock + 1) % num_cpus;
 
         while(bus_lock != 0) {
@@ -186,30 +191,37 @@ SC_MODULE(Cache) {
     }
 
     void write_cache(CacheLine *c_set, uint64_t block_addr, uint64_t addr, uint64_t index) {
+        num_requests_before_me = 0;
         while (bus_lock != my_id) {
             wait_and_invalidate();
         }
+        memory->totalacqtime += sc_time(num_requests_before_me, SC_NS);
+        memory->totalacq += 1;
 
-        cout << "--------- Cache id " << my_id << " aquired the bus ---------" << endl;
+        VERBOSE && cout << "--------- Cache id " << my_id << " acquired the bus ---------" << endl;
         if (c_set[index].tag == block_addr && c_set[index].valid) { // Cache hit 
-            log(name(), "Cache write hit");
+            VERBOSE ? log(name(), "Cache write hit") : (void)0;
             stats_writehit(my_id);
-            wait(1);
+            wait(1); // a local cache access takes 1 cycle 
             refresh_lu_time(c_set, block_addr, addr, index);
         } else {
-            log(name(), "Cache miss, request read from bus for addr", addr);
+            wait(1); // It takes 1 cycle to write on the bus 
+            VERBOSE ? log(name(), "Cache miss, request read from bus for addr", addr) : (void)0;
             stats_writemiss(my_id);
             mem_read(addr);
             wait(Port_BusTransId.value_changed_event());
-            wait(100);
-            log(name(), "reads on bus addr", addr);
+            wait(100); // It takes 100 for a bus reqeust to be served
+            VERBOSE ? log(name(), "reads on bus addr", addr) : (void)0;
             allocate(c_set, block_addr, addr, index, true);
         }
-        log(name(), "finished write to cache", addr);
-        log(name(), "request bus to write back to memory", addr);
+        
+        wait(1); // It takes 1 cycle to write on the bus 
+        VERBOSE ? log(name(), "finished write to cache", addr) : (void)0;
+        VERBOSE ? log(name(), "request bus to write back to memory", addr) : (void)0;
+        wait(100); // It takes 100 for a bus reqeust to be served
         mem_write(addr);
         wait(Port_BusTransId.value_changed_event());
-        log(name(), "finished write back to memory of addr", addr);
+        VERBOSE ? log(name(), "finished write back to memory of addr", addr) : (void)0;
 
         bus_lock = (bus_lock + 1) % num_cpus;
 
@@ -219,24 +231,27 @@ SC_MODULE(Cache) {
     }
 
     void read_cache(CacheLine *c_set, uint64_t block_addr, uint64_t addr, uint64_t index) {
-        uint64_t prev_trans_id = 0;
+        num_requests_before_me = 0;
         while (bus_lock != my_id) {
             wait_and_invalidate();
         }
 
-        cout << "--------- Cache id " << my_id << " aquired the bus ---------" << endl;
+        VERBOSE && cout << "--------- Cache id " << my_id << " acquired the bus ---------" << endl;
         if (c_set[index].tag == block_addr && c_set[index].valid) { // Cache hit 
-            log(name(), "Cache read hit");
+            VERBOSE ? log(name(), "Cache read hit") : (void)0;
             stats_readhit(my_id);
-            wait(1);
+            wait(1); // A local cache access takes 1 cycle 
             refresh_lu_time(c_set, block_addr, addr, index);
         } else { // Load block_addr from main memory and evict if necessary 
-            log(name(), "Cache miss, request read from bus for addr", addr);
+            wait(1); // It takes 1 cycle to write on the bus
+            VERBOSE ? log(name(), "Cache miss, request read from bus for addr", addr) : (void)0;
             stats_readmiss(my_id);
+            memory->totalacq += 1;
+            memory->totalacqtime += sc_time(num_requests_before_me, SC_NS);
             mem_read(addr);
             wait(Port_BusTransId.value_changed_event());
-            wait(100);
-            log(name(), "reads on bus addr", addr);
+            wait(100); // It takes 100 for a bus reqeust to be served
+            VERBOSE ? log(name(), "reads on bus addr", addr) : (void)0;
             allocate(c_set, block_addr, addr, index, false);
         }
 
@@ -340,7 +355,7 @@ SC_MODULE(CPU) {
             Port_cacheFunc.write(f);
 
             if (f == FUNC_WRITE) {
-                log(name(), "(*) sends write for addr", tr_data.addr);
+                VERBOSE ? log(name(), "(*) sends write for addr", tr_data.addr) : (void)0;
                 // Don't have data, we write the address as the data value.
                 Port_cacheData.write(tr_data.addr);
                 wait();
@@ -348,9 +363,9 @@ SC_MODULE(CPU) {
                 Port_cacheData.write(float_64_bit_wire);
 
             } else if (f == FUNC_READ) {
-                log(name(), "(*) sends read for addr", tr_data.addr);
+                VERBOSE ? log(name(), "(*) sends read for addr", tr_data.addr) : (void)0;
             } else {
-                log(name(), "(*) CPU executes NOP");
+                VERBOSE ? log(name(), "(*) CPU executes NOP") : (void)0;
                 Port_cacheFunc.write(f);
             }
             wait(Port_cacheDone.value_changed_event());
@@ -405,6 +420,7 @@ int sc_main(int argc, char *argv[]) {
         std::vector<sc_buffer<Function>*> sigbusFunc(NUM_CPUS);
         std::vector<sc_signal<uint64_t>*> sigbusAddr(NUM_CPUS);
         std::vector<sc_buffer<uint64_t>*> sigbusTransId(NUM_CPUS);
+        std::vector<sc_buffer<uint64_t>*> sigbusCacheId(NUM_CPUS);
         
 
         // Initialize Cache and CPU modules, and connect them
@@ -421,7 +437,7 @@ int sc_main(int argc, char *argv[]) {
             cpus[i]->my_id = i;
             caches[i]->my_id = i;
 
-            // Dynamically allocate the necessary signals for each CPU and Cache
+            // Allocate signals
             sigcacheFunc[i] = new sc_buffer<Function>();
             sigcacheDone[i] = new sc_buffer<Cache::RetCode>();
             sigcacheAddr[i] = new sc_signal<uint64_t>();
@@ -429,6 +445,7 @@ int sc_main(int argc, char *argv[]) {
             sigbusFunc[i] = new sc_buffer<Function>();
             sigbusAddr[i] = new sc_signal<uint64_t>();
             sigbusTransId[i] = new sc_buffer<uint64_t>();
+            sigbusCacheId[i] = new sc_buffer<uint64_t>();
 
             // Connecting ports of Cache and CPU with the corresponding signals
             caches[i]->Port_Func(*sigcacheFunc[i]);
@@ -439,10 +456,12 @@ int sc_main(int argc, char *argv[]) {
             caches[i]->Port_BusFunc(*sigbusFunc[i]);
             caches[i]->Port_BusAddr(*sigbusAddr[i]);
             caches[i]->Port_BusTransId(*sigbusTransId[i]);
+            caches[i]->Port_BusCacheId(*sigbusCacheId[i]);
 
             (*memory->Port_BusCacheFunc[i])(*sigbusFunc[i]);
             (*memory->Port_BusCacheAddr[i])(*sigbusAddr[i]);
             (*memory->Port_BusCacheTransId[i])(*sigbusTransId[i]);
+            (*memory->Port_BusCacheCacheId[i])(*sigbusCacheId[i]);
 
             cpus[i]->Port_cacheFunc(*sigcacheFunc[i]);
             cpus[i]->Port_cacheAddr(*sigcacheAddr[i]);

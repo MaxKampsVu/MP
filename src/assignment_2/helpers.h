@@ -12,6 +12,8 @@ using namespace std;
 
 enum Function {FUNC_READ, FUNC_WRITE, FUNC_NOP};
 
+static bool VERBOSE = true; // Toggle logging  
+
 static size_t NUM_CPUS; 
 
 inline void log_rest() {
