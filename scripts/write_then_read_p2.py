@@ -24,14 +24,9 @@ t.read(0x700)  # P1
 t.write(0x700)  # P0
 t.write(0x700)  # P1
 
-t.read(0x300)  # P1
-t.read(0x300)  # P1
+t.read(0x700)  # P1
+t.read(0x700)  # P1
 t.nop()  # P1
-t.read(0x300)  # P1
-
-t.read(0x400) # P1
-t.read(0x400)
-t.read(0x400)
-t.write(0x400)
+t.read(0x700)  # P1
 
 t.close()

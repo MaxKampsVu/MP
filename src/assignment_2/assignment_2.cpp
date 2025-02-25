@@ -27,8 +27,8 @@ static const size_t SET_ASSOC = 8;
 static const size_t LINE_SIZE = 32; // Byte 
 static const size_t N_SETS = (CACHE_SIZE / LINE_SIZE) / SET_ASSOC; 
 
-static int bus_lock = 0;
-static uint64_t trans_id = 1;
+static int bus_lock = 0; // A lock that gives exclusive access to the bus 
+static uint64_t trans_id = 1; // Unique ID for each bus request 
 
 SC_MODULE(Cache) {
     public:
@@ -131,10 +131,10 @@ SC_MODULE(Cache) {
         c_set[index] = (CacheLine) {.tag = block_addr, .lu_time = sc_time_stamp().to_double(), .valid = true, .dirty = is_write};
     }
 
+    // Invalidate an address after snooping 
     void invalidate() {
         uint64_t addr_bus = Port_BusAddr.read();
         Function func_bus = Port_BusFunc.read();
-        uint64_t trans_id = Port_BusTransId.read();
         
         VERBOSE ? log(name(), "Snooped bus addr", addr_bus) : (void)0;
 
@@ -151,14 +151,16 @@ SC_MODULE(Cache) {
         if(c_set[index].tag == block_addr && c_set[index].valid && func_bus == FUNC_WRITE) {
             c_set[index].valid = false;
             VERBOSE ? log(name(), "Invalidated addr", addr_bus) : (void)0;
+            memory->totalinv += 1;
         }
     }
 
+    // Snoop a new memory reply from the bus and invalidate accordingly 
     void wait_and_invalidate() {
         wait(Port_BusTransId.value_changed_event());
         uint64_t trans_id = Port_BusTransId.read();
         uint64_t cache_id = Port_BusCacheId.read();
-        //cout << cache_id << endl;
+
         if(prev_trans_id != trans_id && cache_id != my_id) {
             num_requests_before_me++;
             prev_trans_id = trans_id;
@@ -183,7 +185,7 @@ SC_MODULE(Cache) {
 
         VERBOSE && cout << "--------- Cache id " << my_id << " acquired the bus ---------" << endl;
         VERBOSE ? log(name(), "NOP, do nothing") : (void)0;
-        bus_lock = (bus_lock + 1) % num_cpus;
+        bus_lock = (bus_lock + 1) % num_cpus; // Release the lock 
 
         while(bus_lock != 0) {
             wait_and_invalidate();
@@ -191,11 +193,10 @@ SC_MODULE(Cache) {
     }
 
     void write_cache(CacheLine *c_set, uint64_t block_addr, uint64_t addr, uint64_t index) {
-        num_requests_before_me = 0;
         while (bus_lock != my_id) {
             wait_and_invalidate();
         }
-        memory->totalacqtime += sc_time(num_requests_before_me, SC_NS);
+        memory->totalacqtime += sc_time(num_requests_before_me, SC_NS); 
         memory->totalacq += 1;
 
         VERBOSE && cout << "--------- Cache id " << my_id << " acquired the bus ---------" << endl;
@@ -223,7 +224,9 @@ SC_MODULE(Cache) {
         wait(Port_BusTransId.value_changed_event());
         VERBOSE ? log(name(), "finished write back to memory of addr", addr) : (void)0;
 
-        bus_lock = (bus_lock + 1) % num_cpus;
+        bus_lock = (bus_lock + 1) % num_cpus; // Release the lock 
+
+        num_requests_before_me = 0;
 
         while(bus_lock != 0) {
             wait_and_invalidate();
@@ -255,7 +258,7 @@ SC_MODULE(Cache) {
             allocate(c_set, block_addr, addr, index, false);
         }
 
-        bus_lock = (bus_lock + 1) % num_cpus;
+        bus_lock = (bus_lock + 1) % num_cpus; // Release the lock 
 
         while(bus_lock != 0) {
             wait_and_invalidate();
@@ -380,9 +383,6 @@ SC_MODULE(CPU) {
 
 int sc_main(int argc, char *argv[]) {
     try {
-        // Get the tracefile argument and create Tracefile object
-        // This function sets tracefile_ptr and num_cpus
-
         if (argc == 3) {   
             VERBOSE = std::stoi(argv[2]) != 0;
         } else if (argc != 2) {
@@ -399,7 +399,7 @@ int sc_main(int argc, char *argv[]) {
 
         cout << "Running (press CTRL+C to interrupt)... " << endl;
         
-            // Declare signals for all CPUs and caches
+        // Declare signals for all CPUs and caches
         std::vector<sc_buffer<Function>*> sigcacheFunc(NUM_CPUS);
         std::vector<sc_buffer<Cache::RetCode>*> sigcacheDone(NUM_CPUS);
         std::vector<sc_signal<uint64_t>*> sigcacheAddr(NUM_CPUS);
@@ -415,7 +415,6 @@ int sc_main(int argc, char *argv[]) {
         Memory *memory = new Memory("memory");
         memory->Port_CLK(clk);
 
-
         //Signals between memory and cache
         std::vector<sc_buffer<Function>*> sigbusFunc(NUM_CPUS);
         std::vector<sc_signal<uint64_t>*> sigbusAddr(NUM_CPUS);
@@ -428,7 +427,7 @@ int sc_main(int argc, char *argv[]) {
             std::string cache_name = "cache_" + std::to_string(i);
             std::string cpu_name = "cpu_" + std::to_string(i);
 
-            // Dynamically allocate Cache and CPU
+            // Allocate Cache and CPU
             caches[i] = new Cache(cache_name.c_str());
             caches[i]->memory = memory;
 
@@ -479,6 +478,7 @@ int sc_main(int argc, char *argv[]) {
         // Print statistics after simulation finished
         stats_print();
 
+        // Print bus statistics 
         memory->stats_print();
     }
     catch (exception &e) {

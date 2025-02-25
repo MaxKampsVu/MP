@@ -26,6 +26,7 @@ class Memory : public bus_slave_if, public sc_module {
     int totalacq = 0;
     int totalwritereq = 0;
     int totalreadreq = 0;
+    int totalinv = 0;
     
     sc_in<bool> Port_CLK;
     // Connections to caches
@@ -83,6 +84,7 @@ class Memory : public bus_slave_if, public sc_module {
         }
     }
 
+    // Receive a read request from a cache 
     void read(uint64_t addr, uint64_t trans_id, uint64_t cache_id) {
         assert((addr & 0x3) == 0);
         totalreadreq += 1;
@@ -90,6 +92,7 @@ class Memory : public bus_slave_if, public sc_module {
         request_queue.push((request) {.addr = addr, .func = FUNC_READ, .trans_id = trans_id, .cache_id = cache_id});
     }
 
+    // Receive a read request from a cache 
     void write(uint64_t addr, uint64_t trans_id, uint64_t cache_id) {
         assert((addr & 0x3) == 0);
         totalwritereq += 1;
@@ -100,8 +103,9 @@ class Memory : public bus_slave_if, public sc_module {
     void stats_print() {
         cout << "Memory reads: " << totalreadreq << endl;
         cout << "Memory writes: " << totalwritereq << endl;
+        cout << "Total invalidations: " << totalinv << endl;
         cout << "Total aquisitions: " << totalacq << endl;
-        cout << "Total aquisition wait time: " << totalacqtime << " ns" << endl;
+        cout << "Total aquisition wait time: " << totalacqtime << endl;
         cout << "Average aquisition wait time: " << (totalacqtime / totalacq) << endl;
     }
 };
