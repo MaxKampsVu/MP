@@ -392,7 +392,7 @@ int sc_main(int argc, char *argv[]) {
         init_tracefile(&argc, &argv);
 
         NUM_CPUS = tracefile_ptr->get_proc_count();
-        cout << "Executing with " << NUM_CPUS << " CPUS" << endl;
+        cout << "Executing with " << NUM_CPUS << "CPUS" << endl;
 
         // Initialize statistics counters
         stats_init();
